@@ -40,7 +40,8 @@
 #include <cocaine/context.hpp>
 #include <cocaine/logging.hpp>
 #include <cocaine/app.hpp>
-#include <cocaine/job.hpp>
+#include <cocaine/api/stream.hpp>
+#include <cocaine/api/event.hpp>
 
 #include <elliptics/interface.h>
 #include <elliptics/srw.h>
@@ -162,37 +163,36 @@ class dnet_sink_t: public cocaine::logging::sink_t {
 		struct dnet_session *m_s;
 };
 
-class dnet_job_t: public cocaine::engine::job_t
+class dnet_stream_t: public cocaine::api::stream_t
 {
 	public:
-		dnet_job_t(struct dnet_session *session, const std::string &app, const std::string& event, const cocaine::blob_t& blob):
-		cocaine::engine::job_t(event, blob),
+		dnet_stream_t(struct dnet_session *session, const std::string &name):
 		m_completed(false),
-		m_name(app + "/" + event),
+		m_name(name),
        		m_s(session) {
 		}
 
-		virtual void react(const cocaine::engine::events::chunk& event) {
+		virtual void push(const void *data, size_t size) {
 			boost::mutex::scoped_lock guard(m_lock);
-			m_res.insert(m_res.end(), (char *)event.message.data(), (char *)event.message.data() + event.message.size());
+			m_res.insert(m_res.end(), (char *)data, (char *)data + size);
 
 			std::ostringstream msg;
-			msg << "received reply chunk: size: " << event.message.size() << ", data: '" << event.message.data() << "', " <<
+			msg << "received reply chunk: size: " << size << ", data: '" << data << "', " <<
 				"accumulated-reply-size: " << m_res.size() << std::endl;
 
 			srw_log log(m_s, DNET_LOG_NOTICE, "app/" + m_name, msg.str());
 		}
 
-		virtual void react(const cocaine::engine::events::choke& ) {
-			srw_log log(m_s, DNET_LOG_NOTICE, "app/" + m_name, "job completed, data size: " +
+		virtual void close(void) {
+			srw_log log(m_s, DNET_LOG_NOTICE, "app/" + m_name, "stream completed, data size: " +
 					boost::lexical_cast<std::string>(m_res.size()));
 
 			if (m_res.size())
 				reply(true, NULL, 0);
 		}
 
-		virtual void react(const cocaine::engine::events::error& event) {
-			srw_log log(m_s, DNET_LOG_ERROR, "app/" + m_name, event.message + ": " + boost::lexical_cast<std::string>(event.code));
+		virtual void error(const enum cocaine::error_code code, const std::string &message) {
+			srw_log log(m_s, DNET_LOG_ERROR, "app/" + m_name, message + ": " + boost::lexical_cast<std::string>(code));
 		}
 
 		void reply(bool completed, const char *reply, size_t size) {
@@ -230,71 +230,10 @@ class dnet_job_t: public cocaine::engine::job_t
 		boost::condition m_cond;
 };
 
-typedef boost::shared_ptr<dnet_job_t> dnet_shared_job_t;
+typedef boost::shared_ptr<dnet_stream_t> dnet_shared_stream_t;
 
-class app_watcher {
-	public:
-		app_watcher(cocaine::context_t &ctx, const std::string &app) :
-		m_need_exit(false) {
-			m_app.reset(new cocaine::app_t(ctx, app));
-			m_app->start();
-
-			m_thread = boost::thread(&app_watcher::process, this);
-		}
-
-		~app_watcher() {
-			boost::mutex::scoped_lock guard(m_lock);
-			m_need_exit = true;
-			m_cond.notify_one();
-			guard.unlock();
-
-			m_thread.join();
-		}
-
-		void push(dnet_shared_job_t job) {
-			boost::mutex::scoped_lock guard(m_lock);
-
-			m_jobs.push_back(job);
-			m_cond.notify_one();
-		}
-
-		std::string info() {
-			return Json::FastWriter().write(m_app->info());
-		}
-
-	private:
-		bool m_need_exit;
-		boost::condition m_cond;
-		boost::mutex m_lock;
-		std::deque<dnet_shared_job_t> m_jobs;
-		boost::thread m_thread;
-		std::auto_ptr<cocaine::app_t> m_app;
-
-		void process() {
-			while (!m_need_exit) {
-
-				boost::mutex::scoped_lock guard(m_lock);
-				if (m_jobs.empty()) {
-					m_cond.wait(guard);
-				}
-
-				if (m_need_exit)
-					break;
-
-				if (!m_jobs.empty()) {
-					dnet_shared_job_t job = m_jobs.front();
-					m_jobs.pop_front();
-					guard.unlock();
-
-					m_app->enqueue(job, cocaine::engine::mode::blocking);
-				}
-			}
-		}
-
-};
-
-typedef std::map<std::string, boost::shared_ptr<app_watcher> > eng_map_t;
-typedef std::map<int, dnet_shared_job_t> jobs_map_t;
+typedef std::map<std::string, boost::shared_ptr<cocaine::app_t> > eng_map_t;
+typedef std::map<int, dnet_shared_stream_t> streams_map_t;
 
 namespace {
 	cocaine::logging::priorities dnet_log_level_to_prio(int level) {
@@ -344,7 +283,9 @@ class srw {
 			std::string ev = strs[1];
 
 			if (ev == "start-task") {
-				boost::shared_ptr<app_watcher> eng(new app_watcher(m_ctx, app));
+				boost::shared_ptr<cocaine::app_t> eng(new cocaine::app_t(m_ctx, app, app + ".profile"));
+
+				eng->start();
 
 				boost::mutex::scoped_lock guard(m_lock);
 				m_map.insert(std::make_pair(app, eng));
@@ -369,15 +310,15 @@ class srw {
 					return -ENOENT;
 				}
 
-				std::string s = it->second->info();
+				std::string s = it->second->info().asString();
 				dnet_log(m_s->node, DNET_LOG_INFO, "srw: %s: info: %s\n", app.c_str(), s.c_str());
 				return dnet_send_reply(st, cmd, (void *)s.data(), s.size(), 0);
 			} else if (sph->flags & (DNET_SPH_FLAGS_REPLY | DNET_SPH_FLAGS_FINISH)) {
 				boost::mutex::scoped_lock guard(m_lock);
 
-				jobs_map_t::iterator it = m_jobs.find(sph->src_key);
-				if (it == m_jobs.end()) {
-					dnet_log(m_s->node, DNET_LOG_ERROR, "srw: %s: %s: no job(%x) to complete\n",
+				streams_map_t::iterator it = m_streams.find(sph->src_key);
+				if (it == m_streams.end()) {
+					dnet_log(m_s->node, DNET_LOG_ERROR, "srw: %s: %s: no stream(%x) to complete\n",
 							app.c_str(), dnet_dump_id(&cmd->id), sph->src_key);
 					return -ENOENT;
 				}
@@ -389,7 +330,7 @@ class srw {
 						app.c_str(), sph->src_key, total_size(sph), final);
 
 				if (final)
-					m_jobs.erase(it);
+					m_streams.erase(it);
 
 				return 0;
 			} else {
@@ -405,25 +346,28 @@ class srw {
 					return -ENOENT;
 				}
 
-				dnet_shared_job_t job(boost::make_shared<dnet_job_t>(m_s, app, ev,
-						cocaine::blob_t((const char *)sph, total_size(sph) + sizeof(struct sph))));
+				dnet_shared_stream_t stream(boost::make_shared<dnet_stream_t>(m_s, app + "/" + ev));
 
 				if (sph->flags & DNET_SPH_FLAGS_SRC_BLOCK)
-					m_jobs.insert(std::make_pair(sph->src_key, job));
+					m_streams.insert(std::make_pair((int)sph->src_key, stream));
 
-				it->second->push(job);
+				cocaine::api::event_t cevent(ev);
+				boost::shared_ptr<cocaine::api::stream_t> out = it->second->enqueue(cevent,
+						stream, cocaine::engine::mode::blocking);
+				out->push((const char *)sph, total_size(sph) + sizeof(struct sph));
+
 				guard.unlock();
 
-				dnet_log(m_s->node, DNET_LOG_INFO, "srw: %s: started: task: %x, total-data-size: %zd, block: %d\n",
-						app.c_str(), sph->src_key, total_size(sph), !!(sph->flags & DNET_SPH_FLAGS_SRC_BLOCK));
+				dnet_log(m_s->node, DNET_LOG_INFO, "srw: %s/%s: started: task: %x, total-data-size: %zd, block: %d\n",
+						app.c_str(), ev.c_str(), sph->src_key, total_size(sph), !!(sph->flags & DNET_SPH_FLAGS_SRC_BLOCK));
 
 				int err = 0;
 				if (sph->flags & DNET_SPH_FLAGS_SRC_BLOCK) {
-					bool success = job->wait(m_s->node->wait_ts.tv_sec);
+					bool success = stream->wait(m_s->node->wait_ts.tv_sec);
 					if (!success)
 						throw std::runtime_error("timeout waiting for exec command to complete");
 
-					std::vector<char> res = job->result();
+					std::vector<char> res = stream->result();
 					if (res.size()) {
 						err = dnet_send_reply(st, cmd, res.data(), res.size(), 0);
 					}
@@ -441,7 +385,7 @@ class srw {
 		cocaine::context_t		m_ctx;
 		boost::mutex			m_lock;
 		eng_map_t			m_map;
-		jobs_map_t			m_jobs;
+		streams_map_t			m_streams;
 
 		std::string dnet_get_event(const struct sph *sph, const char *data) {
 			return std::string(data, sph->event_size);

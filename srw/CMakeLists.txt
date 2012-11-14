@@ -1,6 +1,10 @@
 include_directories(../include)
 include_directories(../library)
 
+if (UNIX OR MINGW)
+	add_definitions(-std=c++11)
+endif()
+
 add_library(elliptics_cocaine SHARED srw.cpp)
 set_target_properties(elliptics_cocaine PROPERTIES
     VERSION ${ELLIPTICS_VERSION}
