@@ -346,6 +346,10 @@ class srw {
 					return -ENOENT;
 				}
 
+				/*
+				 * this stream must be saved otherwise it will be turned into weak pointer
+				 * in cocaine and no callback will be ever called
+				 */
 				dnet_shared_stream_t stream(boost::make_shared<dnet_stream_t>(m_s, app + "/" + ev));
 
 				if (sph->flags & DNET_SPH_FLAGS_SRC_BLOCK)
