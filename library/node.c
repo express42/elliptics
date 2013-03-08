@@ -572,21 +572,18 @@ struct dnet_node *dnet_node_create(struct dnet_config *cfg)
 
 	if (!n->wait_ts.tv_sec) {
 		n->wait_ts.tv_sec = 5;
-		dnet_log(n, DNET_LOG_NOTICE, "Using default wait timeout (%ld seconds).\n",
-				n->wait_ts.tv_sec);
 	}
+        dnet_log(n, DNET_LOG_NOTICE, "Wait timeout: %ld seconds.\n", n->wait_ts.tv_sec);
 
 	if (!n->check_timeout) {
 		n->check_timeout = DNET_DEFAULT_CHECK_TIMEOUT_SEC;
-		dnet_log(n, DNET_LOG_NOTICE, "Using default check timeout (%ld seconds).\n",
-				n->check_timeout);
 	}
+        dnet_log(n, DNET_LOG_NOTICE, "Check timeout: %ld seconds.\n", n->check_timeout);
 
 	if (!n->stall_count) {
 		n->stall_count = DNET_DEFAULT_STALL_TRANSACTIONS;
-		dnet_log(n, DNET_LOG_NOTICE, "Using default stall count (%ld transactions).\n",
-				n->stall_count);
 	}
+        dnet_log(n, DNET_LOG_NOTICE, "Stall count: %ld transactions.\n", n->stall_count);
 
 	n->client_prio = cfg->client_prio;
 	n->server_prio = cfg->server_prio;
@@ -674,7 +671,7 @@ struct dnet_session *dnet_session_create(struct dnet_node *n)
 	struct dnet_session *s;
 
 	s = (struct dnet_session *)malloc(sizeof(struct dnet_session));
-	if (!s) 
+        if (!s)
 		return NULL;
 
 	s->node = n;
